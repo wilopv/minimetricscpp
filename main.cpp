@@ -7,6 +7,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <cstdlib>
+#include <iomanip>
 
 
 // Boost.Beast/Asio
@@ -19,12 +21,35 @@ namespace http  = beast::http;
 namespace net   = boost::asio;
 using tcp = net::ip::tcp;
 
+// HELPER FUNCTIONS
+// Read an unsigned short from env
+static unsigned short env_port(const char* name, unsigned short fallback) {
+    if (const char* v = std::getenv(name)) {
+        try {
+            long val = std::stol(v);
+            if (val > 0 && val <= 65535) return static_cast<unsigned short>(val);
+        } catch (...) {}
+    }
+    return fallback;
+}
+
+// Read interval (ms) from env, with sane bounds (100ms to 60000ms)
+static std::chrono::milliseconds env_interval_ms(const char* name, int fallback_ms) {
+    if (const char* v = std::getenv(name)) {
+        try {
+            long val = std::stol(v);
+            if (val >= 100 && val <= 60'000) return std::chrono::milliseconds(val);
+        } catch (...) {}
+    }
+    return std::chrono::milliseconds(fallback_ms);
+}
+
 // Collector class to gather CPU and memory usage metrics
 class MetricsCollector {
 public:
-    MetricsCollector() = default;
+    MetricsCollector(std::chrono::milliseconds interval) : interval_(interval) {}
     ~MetricsCollector() { stop(); }
-
+    
     void start() {
         if (running.exchange(true)) return;
         worker = std::thread(&MetricsCollector::loop, this);
@@ -38,15 +63,20 @@ public:
     std::string renderPrometheus() const {
         std::lock_guard<std::mutex> lock(mtx);
         std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+
         oss << "# HELP cpu_usage Porcentaje de uso de CPU\n"
             << "# TYPE cpu_usage gauge\n"
-            << "cpu_usage " << cpu_ << "\n"
+            << "cpu_usage " << std::setprecision(2) << cpu_ << "\n"
             << "# HELP mem_usage Porcentaje de uso de memoria\n"
             << "# TYPE mem_usage gauge\n"
-            << "mem_usage " << mem_ << "\n"
+            << "mem_usage " << std::setprecision(2) << mem_ << "\n"
             << "# HELP uptime_seconds Tiempo activo del servicio\n"
             << "# TYPE uptime_seconds counter\n"
-            << "uptime_seconds " << uptime_ << "\n";
+            << "uptime_seconds " << uptime_ << "\n"
+            << "# HELP collector_up 1 si la última lectura fue correcta\n"
+            << "# TYPE collector_up gauge\n"
+            << "collector_up " << (lastCpuReadOk_ && lastMemReadOk_ ? 1 : 0) << "\n";
         return oss.str();
     }
 
@@ -68,13 +98,16 @@ private:
                 mem_ = readMemPercent();
                 ++uptime_;
             }
-            std::this_thread::sleep_for(1s);
+            std::this_thread::sleep_for(interval_);
         }
     }
 
     double readCpuPercent() {
         std::ifstream stat("/proc/stat");
-        if (!stat.good()) return 0.0;
+        if (!stat.good()) {
+            lastCpuReadOk_ = false;
+            return 0.0;
+        }
 
         std::string cpuLabel;
         // /proc/stat file line format: cpu  3357 0 4313 1362393 ... which corresponds to:
@@ -91,6 +124,7 @@ private:
             prevIdle_ = idleAll;
             prevTotal_ = total;
             hasPrev_ = true;
+            lastCpuReadOk_ = true; // first read is always OK
             return 0.0;
         }
 
@@ -100,9 +134,12 @@ private:
         prevIdle_  = idleAll;
         prevTotal_ = total;
 
+        lastCpuReadOk_ = (totalDelta != 0);
+        if (!lastCpuReadOk_) return 0.0;
+
         //avoid division by zero
         if (totalDelta == 0) return 0.0;
-        double usage = 100.0 * (1.0 - (double)idleDelta / (double)totalDelta);
+        double usage = 100.0 * (1.0 - static_cast<double>(idleDelta) / static_cast<double>(totalDelta));
         if (usage < 0.0)   usage = 0.0;
         if (usage > 100.0) usage = 100.0;
         return usage;
@@ -110,7 +147,10 @@ private:
 
     double readMemPercent() {
         std::ifstream meminfo("/proc/meminfo");
-        if (!meminfo.good()) return 0.0;
+        if (!meminfo.good()) {
+            lastMemReadOk_ = false;
+            return 0.0;
+        }
 
         // /proc/meminfo file lines of interest:
         // MemTotal:       16384256 kB
@@ -127,10 +167,11 @@ private:
             if (memTotal && memAvail) break;
         }
 
-        if (memTotal == 0) return 0.0;
-        double used = (double)(memTotal - memAvail);
-        // Calculate memory usage percentage
-        return 100.0 * used / (double)memTotal;
+        lastMemReadOk_ = (memTotal > 0);
+        if (!lastMemReadOk_) return 0.0;
+
+        double used = static_cast<double>(memTotal - memAvail);
+        return 100.0 * used / static_cast<double>(memTotal);
     }
 
     std::atomic<bool> running{false};
@@ -145,6 +186,13 @@ private:
     unsigned long long prevIdle_{0};
     unsigned long long prevTotal_{0};
     bool hasPrev_{false};
+
+    // Health flags for last reads
+    bool lastCpuReadOk_{false};
+    bool lastMemReadOk_{false};
+
+    // Interval between metric collections
+    std::chrono::milliseconds interval_{1000};
 };
 
 /* -------------------- Simple synchronous HTTP server -------------------- */
@@ -214,13 +262,18 @@ int main() {
     std::signal(SIGINT,  handleSig);
     std::signal(SIGTERM, handleSig);
 
-    MetricsCollector mc;
+    // Read configuration from environment variables
+    const unsigned short port = env_port("PORT", 8080);
+    const auto interval = env_interval_ms("INTERVAL_MS", 1000);
+    std::cout << "Usando puerto " << port << " e intervalo " << interval.count() << " ms\n";
+
+    MetricsCollector mc(interval);
     mc.start();
 
     // we must wait a bit to have some metrics collected
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 
-    run_http_server(8080, mc);
+    run_http_server(port, mc);
 
     mc.stop();
     std::cout << "Apagando...\n";
