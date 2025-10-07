@@ -11,7 +11,8 @@
 
 // Boost.Beast/Asio
 #include <boost/asio.hpp>
-#include <boost/beast.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 
 namespace beast = boost::beast;
 namespace http  = beast::http;
